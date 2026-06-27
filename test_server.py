@@ -225,3 +225,68 @@ class TestSolveScaling:
 
 
 import pytest  # noqa: E402 — kept at bottom so the mock setup runs first
+
+
+# ---------------------------------------------------------------------------
+# optimize tool
+# ---------------------------------------------------------------------------
+
+class TestOptimizeTool:
+    def _call(self, variables, objective, hard_constraints, soft_constraints=None, **kwargs):
+        payload = {
+            "variables": variables,
+            "objective": objective,
+            "hard_constraints": hard_constraints,
+        }
+        if soft_constraints is not None:
+            payload["soft_constraints"] = soft_constraints
+        payload.update(kwargs)
+        return _parse(_run(server.call_tool("optimize", payload)))
+
+    def test_maximize_via_server(self):
+        result = self._call(
+            variables={"a": {"min": 0, "max": 10}, "b": {"min": 0, "max": 20}},
+            objective={"expr": "a + b", "direction": "maximize"},
+            hard_constraints=[],
+        )
+        assert result["status"] in ("OPTIMAL", "FEASIBLE")
+        assert result["objective_value"] == pytest.approx(30, abs=1)
+
+    def test_minimize_via_server(self):
+        result = self._call(
+            variables={"cost": {"min": 0, "max": 1000}},
+            objective={"expr": "cost", "direction": "minimize"},
+            hard_constraints=[{"lhs": "cost", "rhs": "50", "relation": ">="}],
+        )
+        assert result["status"] in ("OPTIMAL", "FEASIBLE")
+        assert result["objective_value"] == pytest.approx(50, abs=1)
+
+    def test_mult_factor_scaling(self):
+        # price real domain 0..50 with mult_factor=100; maximize price
+        result = self._call(
+            variables={"price": {"min": 0, "max": 50, "mult_factor": 100}},
+            objective={"expr": "price", "direction": "maximize"},
+            hard_constraints=[],
+        )
+        assert result["status"] in ("OPTIMAL", "FEASIBLE")
+        assert result["values"]["price"] == pytest.approx(50.0, abs=0.01)
+        assert result["objective_value"] == pytest.approx(50.0, abs=0.01)
+
+    def test_invalid_objective_short_circuits(self):
+        result = self._call(
+            variables={"x": {"min": 0, "max": 100}},
+            objective={"expr": "-x", "direction": "maximize"},
+            hard_constraints=[],
+        )
+        assert result["status"] == "INVALID_EQUATION"
+
+    def test_infeasible_returns_infeasible(self):
+        result = self._call(
+            variables={"a": {"min": 0, "max": 200}},
+            objective={"expr": "a", "direction": "maximize"},
+            hard_constraints=[
+                {"lhs": "a", "rhs": "100", "relation": ">="},
+                {"lhs": "a", "rhs": "50",  "relation": "<="},
+            ],
+        )
+        assert result["status"] == "INFEASIBLE"

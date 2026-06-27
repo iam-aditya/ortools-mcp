@@ -9,7 +9,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from solver import get_variables, validate_equation, solver as run_solver
+from solver import get_variables, validate_equation, solver as run_solver, optimize as run_optimize
 
 logging.basicConfig(level=logging.INFO)
 
@@ -140,6 +140,76 @@ async def list_tools() -> list[Tool]:
                 "required": ["equations", "values"],
             },
         ),
+        Tool(
+            name="optimize",
+            description=(
+                "Maximize or minimize an objective expression subject to hard constraints "
+                "(must be satisfied) and optional soft constraints (penalized violations). "
+                "Unlike solve, there are no observed values — this is pure optimization: "
+                "find the best possible assignment of variables within their domains."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "variables": {
+                        "type": "object",
+                        "description": (
+                            "Map of variable name → spec. "
+                            "Spec fields: min (default 0), max (default 2e9), "
+                            "mult_factor (int, default 1 — same integer-scaling as solve)."
+                        ),
+                        "additionalProperties": {
+                            "type": "object",
+                            "properties": {
+                                "min": {"type": "number"},
+                                "max": {"type": "number"},
+                                "mult_factor": {"type": "integer"},
+                            },
+                        },
+                    },
+                    "objective": {
+                        "type": "object",
+                        "description": "Expression to optimize.",
+                        "properties": {
+                            "expr": {"type": "string", "description": "Arithmetic expression over variable names, e.g. 'revenue - cost'"},
+                            "direction": {"type": "string", "enum": ["minimize", "maximize"]},
+                        },
+                        "required": ["expr", "direction"],
+                    },
+                    "hard_constraints": {
+                        "type": "array",
+                        "description": "Constraints that must be satisfied. Infeasible if violated.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "lhs": {"type": "string"},
+                                "rhs": {"type": "string"},
+                                "relation": {"type": "string", "enum": ["==", "<=", ">="]},
+                            },
+                            "required": ["lhs", "rhs", "relation"],
+                        },
+                    },
+                    "soft_constraints": {
+                        "type": "array",
+                        "description": "Constraints whose violations are penalized in the objective.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "lhs": {"type": "string"},
+                                "rhs": {"type": "string"},
+                                "relation": {"type": "string", "enum": ["==", "<=", ">="]},
+                                "weight": {"type": "integer"},
+                                "tolerance": {"type": "integer"},
+                            },
+                            "required": ["lhs", "rhs", "relation"],
+                        },
+                    },
+                    "timeout_seconds": {"type": "number"},
+                    "num_workers": {"type": "integer"},
+                },
+                "required": ["variables", "objective", "hard_constraints"],
+            },
+        ),
     ]
 
 
@@ -236,6 +306,32 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 })
 
         return [TextContent(type="text", text=json.dumps(results, indent=2))]
+
+    elif name == "optimize":
+        variables = arguments["variables"]
+        objective = arguments["objective"]
+        hard_constraints = arguments.get("hard_constraints", [])
+        soft_constraints = arguments.get("soft_constraints", [])
+
+        for spec in variables.values():
+            spec.setdefault("mult_factor", 1)
+            mf = spec["mult_factor"]
+            spec["min"] = int(spec.get("min", 0) * mf)
+            spec["max"] = int(spec.get("max", 2_000_000_000 // mf) * mf)
+
+        for c in soft_constraints:
+            c.setdefault("weight", 1000)
+            c.setdefault("tolerance", 0)
+
+        result = run_optimize(
+            var_specs=variables,
+            objective=objective,
+            hard_constraints=hard_constraints,
+            soft_constraints=soft_constraints,
+            timeout_seconds=arguments.get("timeout_seconds", 5),
+            num_workers=arguments.get("num_workers", 8),
+        )
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 

@@ -229,6 +229,15 @@ _STATUS_NAMES = {
 }
 
 
+def _validate_exprs(*exprs: str) -> dict | None:
+    """Return an error dict if any expression fails validate_equation, else None."""
+    for expr in exprs:
+        errs = validate_equation(expr)
+        if errs:
+            return {"status": "INVALID_EQUATION", "errors": errs, "field": expr}
+    return None
+
+
 def solver(
     var_specs: dict,
     equations: list[dict],
@@ -259,10 +268,9 @@ def solver(
     """
     # --- validate equations up front ---
     for eq in equations:
-        for side in ("lhs", "rhs"):
-            errs = validate_equation(eq[side])
-            if errs:
-                return {"status": "INVALID_EQUATION", "errors": errs, "field": eq[side]}
+        err = _validate_exprs(eq["lhs"], eq["rhs"])
+        if err:
+            return err
 
     model = cp_model.CpModel()
     cp_vars: dict = {}
@@ -316,3 +324,110 @@ def solver(
         corrected[k] = raw / mult_factor
 
     return {"status": status_name, "corrected": corrected}
+
+
+def optimize(
+    var_specs: dict,
+    objective: dict,
+    hard_constraints: list,
+    soft_constraints: list = (),
+    timeout_seconds: float = 5,
+    num_workers: int = 8,
+) -> dict:
+    """
+    Find values for variables that optimize an objective subject to constraints.
+
+    var_specs: {
+        "x": {"min": 0, "max": 1000, "mult_factor": 1}
+    }
+    objective: {"expr": "revenue - cost", "direction": "maximize" | "minimize"}
+    hard_constraints: [{"lhs": "...", "rhs": "...", "relation": "==|<=|>="}]
+    soft_constraints: [{"lhs": "...", "rhs": "...", "relation": "...",
+                        "weight": 1000, "tolerance": 0}]
+
+    Returns:
+        {
+            "status": "OPTIMAL",
+            "values": {"revenue": 1000.0, "cost": 400.0},
+            "objective_value": 600.0
+        }
+    """
+    direction = objective.get("direction", "minimize")
+    obj_expr_str = objective["expr"]
+
+    # --- validate all expressions up front ---
+    err = _validate_exprs(obj_expr_str)
+    if err:
+        return err
+    for c in list(hard_constraints) + list(soft_constraints):
+        err = _validate_exprs(c["lhs"], c["rhs"])
+        if err:
+            return err
+
+    model = cp_model.CpModel()
+    cp_vars: dict = {}
+
+    for k, spec in var_specs.items():
+        cp_vars[k] = model.NewIntVar(
+            int(spec.get("min", 0)),
+            int(spec.get("max", MAX)),
+            k,
+        )
+
+    # hard constraints — must be satisfied exactly
+    for c in hard_constraints:
+        new_lhs, new_rhs = move_rhs_divisions_to_lhs(c["lhs"], c["rhs"])
+        add_hard_equation(model, cp_vars, {**c, "lhs": new_lhs, "rhs": new_rhs})
+
+    # soft constraints — violations penalised
+    penalties: list = []
+    for c in soft_constraints:
+        new_lhs, new_rhs = move_rhs_divisions_to_lhs(c["lhs"], c["rhs"])
+        add_soft_constraint(model, cp_vars, {**c, "lhs": new_lhs, "rhs": new_rhs}, penalties)
+
+    # build objective expression
+    obj_raw = build_expr(ast.parse(obj_expr_str, mode="eval").body, model, cp_vars, "obj")
+    obj_var = model.NewIntVar(-MAX, MAX, "objective_var")
+    model.Add(obj_var == obj_raw)
+
+    # set combined objective
+    if penalties:
+        penalty_sum = cp_model.LinearExpr.Sum(penalties)
+        if direction == "minimize":
+            model.Minimize(obj_var + penalty_sum)
+        else:
+            # maximize f while minimising violations = minimize(-f + violations)
+            neg_obj = model.NewIntVar(-MAX, MAX, "neg_obj")
+            model.Add(neg_obj == -obj_var)
+            model.Minimize(neg_obj + penalty_sum)
+    else:
+        if direction == "minimize":
+            model.Minimize(obj_var)
+        else:
+            model.Maximize(obj_var)
+
+    cp_solver = cp_model.CpSolver()
+    cp_solver.parameters.num_search_workers = num_workers
+    cp_solver.parameters.max_time_in_seconds = timeout_seconds
+
+    status = cp_solver.Solve(model)
+    status_name = _STATUS_NAMES.get(status, "UNKNOWN")
+    logger.info("OR-Tools optimize status: %s", status_name)
+
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return {"status": status_name, "values": {}, "objective_value": None}
+
+    # collect real-world variable values
+    real_values: dict = {}
+    for k, spec in var_specs.items():
+        mf = spec.get("mult_factor", 1)
+        real_values[k] = cp_solver.Value(cp_vars[k]) / mf
+
+    # compute objective value in real-world units via safe eval
+    obj_value = eval(  # noqa: S307
+        compile(obj_expr_str, "<objective>", "eval"),
+        {"__builtins__": {}},
+        real_values,
+    )
+
+    return {"status": status_name, "values": real_values, "objective_value": obj_value}

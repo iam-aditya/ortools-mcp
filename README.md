@@ -167,6 +167,69 @@ Status values: `passed`, `failed`, `missing_values` (variable not in `values`), 
 
 ---
 
+### `optimize`
+
+Maximize or minimize an objective expression subject to constraints. Unlike `solve`, there are no observed values — this is pure optimization: find the best possible assignment of variables within their domains.
+
+**Example use cases:**
+- Maximize margin (`revenue - cost`) subject to budget and inventory limits
+- Minimize waste subject to production constraints
+- Find the best allocation of a fixed total across items
+
+**Input**
+
+```json
+{
+  "variables": {
+    "units": { "min": 0, "max": 1000, "mult_factor": 1 },
+    "price": { "min": 0, "max": 500,  "mult_factor": 100 }
+  },
+  "objective": {
+    "expr": "units * price",
+    "direction": "maximize"
+  },
+  "hard_constraints": [
+    { "lhs": "units + price", "rhs": "120", "relation": "<=" }
+  ],
+  "soft_constraints": [
+    { "lhs": "price", "rhs": "50", "relation": "<=", "weight": 500, "tolerance": 0 }
+  ],
+  "timeout_seconds": 5,
+  "num_workers": 8
+}
+```
+
+**Output**
+
+```json
+{
+  "status": "OPTIMAL",
+  "values": { "units": 100, "price": 20.0 },
+  "objective_value": 2000.0
+}
+```
+
+- `values` contains all variables (real-world units, divided by `mult_factor`)
+- `objective_value` is computed from the real-world values after solving
+- Status values: `OPTIMAL`, `FEASIBLE`, `INFEASIBLE`, `UNKNOWN`, `INVALID_EQUATION`
+
+**Constraint types**
+
+| Type | Behaviour |
+|---|---|
+| `hard_constraints` | Must be satisfied. If any are contradictory the solver returns `INFEASIBLE`. |
+| `soft_constraints` | Violations are penalised in the objective (for maximize: subtracted; for minimize: added). Same `weight`/`tolerance` fields as `solve`. |
+
+**Variable spec** (simpler than `solve` — no `obs`, `confidence`, or `fixed`):
+
+| Field | Default | Note |
+|---|---|---|
+| `min` | `0` | Domain lower bound (real-world units) |
+| `max` | `2e9 // mult_factor` | Domain upper bound (real-world units) |
+| `mult_factor` | `1` | Same integer-scaling as `solve` |
+
+---
+
 ## Supported expression syntax
 
 Both `lhs` and `rhs` accept arithmetic expressions over variable names and numeric constants:

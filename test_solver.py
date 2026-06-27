@@ -4,6 +4,7 @@ from solver import (
     validate_equation,
     move_rhs_divisions_to_lhs,
     solver,
+    optimize,
 )
 
 
@@ -276,3 +277,112 @@ class TestSolver:
             ],
         )
         assert result["corrected"]["total"] == pytest.approx(110, abs=1)
+
+
+# ---------------------------------------------------------------------------
+# optimize
+# ---------------------------------------------------------------------------
+
+def _var(min_=0, max_=1000, mult_factor=1):
+    return {"min": int(min_ * mult_factor), "max": int(max_ * mult_factor), "mult_factor": mult_factor}
+
+
+class TestOptimize:
+    def test_maximize_simple(self):
+        # maximize a + b; a ≤ 10, b ≤ 20
+        result = optimize(
+            var_specs={"a": _var(0, 10), "b": _var(0, 20)},
+            objective={"expr": "a + b", "direction": "maximize"},
+            hard_constraints=[],
+        )
+        assert result["status"] in ("OPTIMAL", "FEASIBLE")
+        assert result["values"]["a"] == pytest.approx(10, abs=1)
+        assert result["values"]["b"] == pytest.approx(20, abs=1)
+        assert result["objective_value"] == pytest.approx(30, abs=1)
+
+    def test_minimize_simple(self):
+        # minimize cost; cost ≥ 50
+        result = optimize(
+            var_specs={"cost": _var(0, 1000)},
+            objective={"expr": "cost", "direction": "minimize"},
+            hard_constraints=[{"lhs": "cost", "rhs": "50", "relation": ">="}],
+        )
+        assert result["status"] in ("OPTIMAL", "FEASIBLE")
+        assert result["values"]["cost"] == pytest.approx(50, abs=1)
+        assert result["objective_value"] == pytest.approx(50, abs=1)
+
+    def test_hard_constraint_must_hold(self):
+        # maximize a; hard: a + b == 100, a ≤ 80 (via domain)
+        result = optimize(
+            var_specs={"a": _var(0, 80), "b": _var(0, 100)},
+            objective={"expr": "a", "direction": "maximize"},
+            hard_constraints=[{"lhs": "a + b", "rhs": "100", "relation": "=="}],
+        )
+        assert result["status"] in ("OPTIMAL", "FEASIBLE")
+        assert result["values"]["a"] == pytest.approx(80, abs=1)
+        assert result["values"]["b"] == pytest.approx(20, abs=1)
+
+    def test_soft_constraint_trades_off_with_objective(self):
+        # maximize a (domain 0..100); soft: a ≤ 80 with heavy weight
+        # penalty at a=100: weight*(100-80)=5000*20=100000 → net = 100 - 100000 = negative
+        # at a=80: penalty=0, net=80 → solver prefers a=80
+        result = optimize(
+            var_specs={"a": _var(0, 100)},
+            objective={"expr": "a", "direction": "maximize"},
+            hard_constraints=[],
+            soft_constraints=[
+                {"lhs": "a", "rhs": "80", "relation": "<=", "weight": 5000, "tolerance": 0}
+            ],
+        )
+        assert result["status"] in ("OPTIMAL", "FEASIBLE")
+        assert result["values"]["a"] <= 81  # stays at or near soft cap
+
+    def test_mult_factor_scales_and_divides_back(self):
+        # maximize price (real domain 0..50.00, mult_factor=100)
+        result = optimize(
+            var_specs={"price": _var(0, 50, mult_factor=100)},
+            objective={"expr": "price", "direction": "maximize"},
+            hard_constraints=[],
+        )
+        assert result["status"] in ("OPTIMAL", "FEASIBLE")
+        assert result["values"]["price"] == pytest.approx(50.0, abs=0.01)
+        assert result["objective_value"] == pytest.approx(50.0, abs=0.01)
+
+    def test_invalid_objective_returns_error(self):
+        result = optimize(
+            var_specs={"revenue": _var(0, 1000)},
+            objective={"expr": "-revenue", "direction": "maximize"},
+            hard_constraints=[],
+        )
+        assert result["status"] == "INVALID_EQUATION"
+        assert "errors" in result
+
+    def test_invalid_constraint_returns_error(self):
+        result = optimize(
+            var_specs={"a": _var(0, 100)},
+            objective={"expr": "a", "direction": "maximize"},
+            hard_constraints=[{"lhs": "-a", "rhs": "0", "relation": ">="}],
+        )
+        assert result["status"] == "INVALID_EQUATION"
+
+    def test_infeasible_hard_constraints(self):
+        # a >= 100 and a <= 50 — impossible
+        result = optimize(
+            var_specs={"a": _var(0, 200)},
+            objective={"expr": "a", "direction": "maximize"},
+            hard_constraints=[
+                {"lhs": "a", "rhs": "100", "relation": ">="},
+                {"lhs": "a", "rhs": "50", "relation": "<="},
+            ],
+        )
+        assert result["status"] == "INFEASIBLE"
+
+    def test_all_variables_returned(self):
+        # all vars should appear in values, not just the objective one
+        result = optimize(
+            var_specs={"x": _var(0, 10), "y": _var(0, 10)},
+            objective={"expr": "x", "direction": "maximize"},
+            hard_constraints=[{"lhs": "x + y", "rhs": "10", "relation": "=="}],
+        )
+        assert "x" in result["values"]
+        assert "y" in result["values"]
